@@ -1,0 +1,489 @@
+"use client";
+import { useState, useEffect, useCallback } from "react";
+import { useWallet } from "@/context/WalletContext";
+import { useTheme } from "@/context/ThemeContext";
+import {
+  getBountyBoard, formatEth, formatDate, timeRemaining,
+  shortenAddress, BOUNTY_STATUS, SUBMISSION_STATUS, CONTRACT_ADDRESSES, NATIVE_SYMBOL,
+} from "@/lib/contracts";
+import { resolveIpfsUrl } from "@/lib/ipfs";
+import IpfsFileUpload from "@/components/IpfsFileUpload";
+import { ethers } from "ethers";
+import Link from "next/link";
+import { Input } from "@/components/reactbits/Input";
+import { Label } from "@/components/reactbits/Label";
+import { Target, X } from "lucide-react";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+export default function BountiesPage() {
+  const { address, signer, provider } = useWallet();
+  const { colors } = useTheme();
+  const [bounties, setBounties] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [selectedBounty, setSelectedBounty] = useState<any | null>(null);
+  const [submissions, setSubmissions] = useState<any[]>([]);
+  const [showCreate, setShowCreate] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [bountyFilter, setBountyFilter] = useState<"all" | "open" | "completed">("all");
+  const configured = CONTRACT_ADDRESSES.BountyBoard !== "";
+
+  // ── Dynamic contract params
+  const [bountyVrtReward, setBountyVrtReward] = useState("5");
+
+  // ── Form state
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [category, setCategory] = useState("");
+  const [reward, setReward] = useState("");
+  const [deadline, setDeadline] = useState("");
+  const [maxWinners, setMaxWinners] = useState("1");
+
+  // ── Submit work form
+  const [subDesc, setSubDesc] = useState("");
+  const [subProof, setSubProof] = useState("");
+
+  const approvedFromSubmissions = submissions.filter((s) => Number(s.status) === 1).length;
+  const maxWinnersCount = selectedBounty ? Number(selectedBounty.maxWinners) : 0;
+  const approvedCount = selectedBounty
+    ? Math.max(Number(selectedBounty.approvedCount), approvedFromSubmissions)
+    : 0;
+  const winnerSlotsFilled = !!selectedBounty && approvedCount >= maxWinnersCount;
+  const effectiveStatus = selectedBounty
+    ? (winnerSlotsFilled ? 1 : Number(selectedBounty.status))
+    : 0;
+
+  const getEffectiveBountyStatus = (b: any): number => {
+    const approved = Number(b.approvedCount);
+    const maxWinners = Number(b.maxWinners);
+    if (maxWinners > 0 && approved >= maxWinners) return 1;
+    return Number(b.status);
+  };
+
+  const isBountyExpired = (b: any): boolean => Number(b.deadline) <= Math.floor(Date.now() / 1000);
+
+  const loadBounties = useCallback(async () => {
+    if (!configured || !provider) return;
+    try {
+      const bb = getBountyBoard(provider);
+      const count = Number(await bb.bountyCounter());
+      const arr: any[] = [];
+      for (let i = count; i >= 1; i--) {
+        try { arr.push(await bb.getBounty(i)); } catch {}
+      }
+      setBounties(arr);
+      try { setBountyVrtReward(ethers.formatEther(await bb.BOUNTY_VRT_REWARD())); } catch {}
+    } catch {} finally { setLoading(false); }
+  }, [provider, configured]);
+
+  useEffect(() => { loadBounties(); }, [loadBounties]);
+
+  const loadSubmissions = useCallback(async (bountyId: number) => {
+    if (!provider) return;
+    try {
+      const bb = getBountyBoard(provider);
+      setSubmissions(await bb.getBountySubmissions(bountyId));
+    } catch { setSubmissions([]); }
+  }, [provider]);
+
+  useEffect(() => {
+    if (selectedBounty) loadSubmissions(Number(selectedBounty.id));
+  }, [selectedBounty, loadSubmissions]);
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    if (!signer) return;
+    setBusy(true);
+    try {
+      const bb = getBountyBoard(signer);
+      const deadlineTs = Math.floor(new Date(deadline).getTime() / 1000);
+      const tx = await bb.createBounty(title, description, category, deadlineTs, parseInt(maxWinners) || 1, {
+        value: ethers.parseEther(reward),
+      });
+      await tx.wait();
+      setShowCreate(false);
+      setTitle(""); setDescription(""); setCategory(""); setReward(""); setDeadline(""); setMaxWinners("1");
+      window.dispatchEvent(new Event("dfm:tx"));
+      loadBounties();
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  async function handleSubmitWork(bountyId: number) {
+    if (!signer) return;
+    setBusy(true);
+    try {
+      const bb = getBountyBoard(signer);
+      const bounty = await bb.getBounty(bountyId);
+      const now = Math.floor(Date.now() / 1000);
+      if (Number(bounty.id) === 0) {
+        alert("Bounty not found on the current network. Refresh and open a valid bounty.");
+        return;
+      }
+      if (Number(bounty.status) !== 0) {
+        alert("This bounty is not open for submissions.");
+        return;
+      }
+      if (Number(bounty.deadline) <= now) {
+        alert("This bounty deadline has passed.");
+        return;
+      }
+      if (Number(bounty.approvedCount) >= Number(bounty.maxWinners)) {
+        alert("This bounty already has all winners selected.");
+        return;
+      }
+      const tx = await bb.submitWork(bountyId, subDesc, subProof);
+      await tx.wait();
+      setSubDesc(""); setSubProof("");
+      window.dispatchEvent(new Event("dfm:tx"));
+      loadSubmissions(bountyId);
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  async function handleApprove(submissionId: number, bountyId: number) {
+    if (!signer) return;
+    setBusy(true);
+    try {
+      const tx = await getBountyBoard(signer).approveSubmission(submissionId);
+      await tx.wait();
+      window.dispatchEvent(new Event("dfm:tx"));
+      loadSubmissions(bountyId);
+      loadBounties();
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  async function handleReject(submissionId: number, bountyId: number) {
+    if (!signer) return;
+    setBusy(true);
+    try {
+      const tx = await getBountyBoard(signer).rejectSubmission(submissionId);
+      await tx.wait();
+      window.dispatchEvent(new Event("dfm:tx"));
+      loadSubmissions(bountyId);
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  async function handleCancel(bountyId: number) {
+    if (!signer) return;
+    setBusy(true);
+    try {
+      const tx = await getBountyBoard(signer).cancelBounty(bountyId);
+      await tx.wait();
+      window.dispatchEvent(new Event("dfm:tx"));
+      loadBounties();
+      setSelectedBounty(null);
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  if (!configured) {
+    return (
+      <div className="max-w-4xl mx-auto px-4 py-16 text-center" style={{ color: colors.mutedFg }}>
+        <p className="text-lg font-semibold">BountyBoard contract not configured</p>
+        <p className="text-sm mt-2">Deploy contracts and set <code>NEXT_PUBLIC_BOUNTY_BOARD</code> in .env.local</p>
+      </div>
+    );
+  }
+
+  return (
+    <main className="max-w-6xl mx-auto px-4 py-10" style={{ color: colors.pageFg }}>
+      {/* Header */}
+      <div className="mb-10">
+        <div className="flex items-center gap-2 mb-3">
+          <span className="sb-pill" style={{ background: colors.primaryLight, color: colors.primaryFg }}>Bounties</span>
+        </div>
+        <h1 className="text-4xl font-extrabold" style={{ color: colors.pageFg, fontFamily: "var(--font-heading)" }}>Bounty Board</h1>
+        <p className="mt-2 text-base leading-relaxed" style={{ color: colors.mutedFg }}>
+          Open bounties with {NATIVE_SYMBOL} + {bountyVrtReward} VRT rewards — submit work, get paid.
+        </p>
+      </div>
+
+      {/* Tabs + Create button */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
+        <div className="flex gap-6" style={{ borderBottom: `2px solid ${colors.cardBorder}` }}>
+          {([
+            { key: "all", label: "All Bounties" },
+            { key: "open", label: "Open" },
+            { key: "completed", label: "Completed" },
+          ] as const).map((t) => (
+            <button key={t.key} onClick={() => setBountyFilter(t.key)}
+              className="relative pb-2.5 text-sm font-medium transition-colors -mb-[2px]"
+              style={bountyFilter === t.key
+                ? { color: colors.primaryFg, borderBottom: `2px solid ${colors.primaryFg}` }
+                : { color: colors.mutedFg, borderBottom: "2px solid transparent" }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+        {address && (
+          <button onClick={() => setShowCreate(true)}
+            className="px-4 py-2 rounded-lg text-sm font-semibold btn-hover"
+            style={{ background: colors.primary, color: colors.primaryText }}>
+            + Post Bounty
+          </button>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="grid md:grid-cols-2 gap-4">
+          {[1, 2, 3, 4].map((i) => <div key={i} className="rounded-xl h-40 animate-pulse" style={{ background: colors.inputBg }} />)}
+        </div>
+      ) : bounties.length === 0 ? (
+        <div className="text-center py-20 rounded-2xl border" style={{ background: colors.cardBg, borderColor: colors.cardBorder }}>
+          <Target size={40} className="mb-3 mx-auto" style={{ color: colors.mutedFg }} />
+          <p className="font-semibold text-lg" style={{ color: colors.pageFg }}>No bounties yet</p>
+          <p className="text-sm mt-1" style={{ color: colors.mutedFg }}>Be the first to post a bounty!</p>
+        </div>
+      ) : (
+        <div className="grid md:grid-cols-2 gap-4">
+          {bounties
+            .filter((b) => {
+              const s = getEffectiveBountyStatus(b);
+              if (bountyFilter === "open") return s === 0;
+              if (bountyFilter === "completed") return s === 1;
+              return s !== 1;
+            })
+            .map((b) => {
+              const status = getEffectiveBountyStatus(b);
+              return (
+                <div
+                  key={b.id.toString()}
+                  onClick={() => setSelectedBounty(b)}
+                  className="rounded-xl border p-5 cursor-pointer card-hover"
+                  style={{ background: colors.cardBg, borderColor: colors.cardBorder }}
+                >
+                  <div className="flex items-start justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      {b.category && (
+                        <span className="text-xs font-medium px-2 py-0.5 rounded-full"
+                          style={{ background: colors.primaryLight, color: colors.primaryFg }}>
+                          {b.category}
+                        </span>
+                      )}
+                      <span className="text-xs font-semibold px-2 py-0.5 rounded-full"
+                        style={{
+                          background: status === 0 ? colors.successBg : status === 1 ? colors.infoBg : colors.dangerBg,
+                          color: status === 0 ? colors.successText : status === 1 ? colors.infoText : colors.dangerText,
+                        }}>
+                        {BOUNTY_STATUS[status] || "Unknown"}
+                      </span>
+                    </div>
+                    <span className="font-mono font-bold text-sm" style={{ color: colors.successText }}>
+                      {formatEth(b.reward)} {NATIVE_SYMBOL}
+                    </span>
+                  </div>
+                  <h3 className="font-bold text-base mb-1 line-clamp-1" style={{ color: colors.pageFg }}>{b.title}</h3>
+                  <p className="text-xs mb-3 line-clamp-2" style={{ color: colors.mutedFg }}>{b.description}</p>
+                  <div className="flex items-center justify-between text-xs" style={{ color: colors.mutedFg }}>
+                    <span>{timeRemaining(b.deadline)}</span>
+                    <span>{Number(b.approvedCount)}/{Number(b.maxWinners)} winners</span>
+                  </div>
+                </div>
+              );
+            })}
+        </div>
+      )}
+
+      {/* ── Create Bounty Modal ── */}
+      {showCreate && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setShowCreate(false)}>
+          <div className="w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden max-h-[90vh]"
+            style={{ background: colors.cardBg }}
+            onClick={e => e.stopPropagation()}>
+            {/* Modal header bar */}
+            <div className="flex items-center justify-between px-6 py-4" style={{ background: colors.primary }}>
+              <div className="flex items-center gap-2 text-white">
+                <Target size={18} />
+                <span className="font-semibold text-sm">Post a Bounty</span>
+              </div>
+              <button onClick={() => setShowCreate(false)} className="text-white/70 hover:text-white text-lg">&times;</button>
+            </div>
+            <form onSubmit={handleCreate} className="p-6 space-y-4 overflow-y-auto" style={{ maxHeight: "calc(90vh - 60px)" }}>
+              <div>
+                <Label className="mb-1 block text-xs font-medium">Title</Label>
+                <Input value={title} onChange={e => setTitle(e.target.value)} required />
+              </div>
+              <div>
+                <Label className="mb-1 block text-xs font-medium">Description</Label>
+                <textarea value={description} onChange={e => setDescription(e.target.value)} required rows={3}
+                  className="w-full px-3 py-2 rounded-xl border text-sm outline-none resize-none focus:ring-2"
+                  style={{ background: colors.inputBg, borderColor: colors.inputBorder, color: colors.pageFg } as any} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="mb-1 block text-xs font-medium">Category</Label>
+                  <Input value={category} onChange={e => setCategory(e.target.value)} required />
+                </div>
+                <div>
+                  <Label className="mb-1 block text-xs font-medium">Reward ({NATIVE_SYMBOL})</Label>
+                  <Input type="number" step="0.001" min="0.001" value={reward} onChange={e => setReward(e.target.value)} required
+                    className="font-mono" />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="mb-1 block text-xs font-medium">Deadline</Label>
+                  <Input type="date" value={deadline} onChange={e => setDeadline(e.target.value)} required />
+                </div>
+                <div>
+                  <Label className="mb-1 block text-xs font-medium">Max Winners</Label>
+                  <Input type="number" min="1" max="100" value={maxWinners} onChange={e => setMaxWinners(e.target.value)} required
+                    className="font-mono" />
+                </div>
+              </div>
+              <div className="flex gap-3 pt-2">
+                <button type="button" onClick={() => setShowCreate(false)}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-medium border btn-outline-hover"
+                  style={{ borderColor: colors.cardBorder, color: colors.mutedFg }}>
+                  Cancel
+                </button>
+                <button type="submit" disabled={busy}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 btn-hover"
+                  style={{ background: colors.primary, color: colors.primaryText }}>
+                  {busy ? "Posting…" : "Post Bounty"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── Bounty Detail Modal ── */}
+      {selectedBounty && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setSelectedBounty(null)}>
+          <div className="w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden max-h-[90vh]"
+            style={{ background: colors.cardBg }}
+            onClick={e => e.stopPropagation()}>
+            {/* Modal header bar */}
+            <div className="flex items-center justify-between px-6 py-4" style={{ background: colors.primary }}>
+              <div className="flex items-center gap-2 text-white">
+                <Target size={18} />
+                <span className="font-semibold text-sm">Bounty Details</span>
+              </div>
+              <button onClick={() => setSelectedBounty(null)} className="text-white/70 hover:text-white text-lg">&times;</button>
+            </div>
+            <div className="p-6 overflow-y-auto" style={{ maxHeight: "calc(90vh - 60px)" }}>
+              <div className="mb-4">
+                <h2 className="text-xl font-bold" style={{ color: colors.pageFg }}>{selectedBounty.title}</h2>
+                <p className="text-xs mt-1" style={{ color: colors.mutedFg }}>
+                  Posted by <Link href={`/profile/${selectedBounty.poster}`} className="underline">{shortenAddress(selectedBounty.poster)}</Link>
+                  {" · "}{formatDate(selectedBounty.createdAt)} · {timeRemaining(selectedBounty.deadline)}
+                </p>
+              </div>
+            <p className="text-sm mb-4 whitespace-pre-wrap" style={{ color: colors.pageFg }}>{selectedBounty.description}</p>
+
+            {/* Info cards */}
+            <div className="grid grid-cols-3 gap-3 mb-6">
+              <div className="rounded-xl px-4 py-3" style={{ background: colors.primaryLight }}>
+                <p className="text-xs" style={{ color: colors.mutedFg }}>Reward</p>
+                <p className="font-mono font-bold" style={{ color: colors.primaryFg }}>{formatEth(selectedBounty.reward)} {NATIVE_SYMBOL}</p>
+              </div>
+              <div className="rounded-xl px-4 py-3" style={{ background: colors.surfaceBg }}>
+                <p className="text-xs" style={{ color: colors.mutedFg }}>Winners</p>
+                <p className="font-bold" style={{ color: colors.pageFg }}>{approvedCount}/{maxWinnersCount}</p>
+              </div>
+              <div className="rounded-xl px-4 py-3" style={{ background: colors.surfaceBg }}>
+                <p className="text-xs" style={{ color: colors.mutedFg }}>Status</p>
+                <p className="font-bold" style={{ color: colors.pageFg }}>{BOUNTY_STATUS[effectiveStatus]}</p>
+              </div>
+            </div>
+
+            {/* Cancel button for poster */}
+            {address?.toLowerCase() === selectedBounty.poster.toLowerCase() && effectiveStatus === 0 && !winnerSlotsFilled && (
+              <button onClick={() => handleCancel(Number(selectedBounty.id))} disabled={busy}
+                className="text-xs px-3 py-1.5 rounded-lg mb-4"
+                style={{ background: colors.dangerBg, color: colors.dangerText }}>
+                {busy ? "Cancelling…" : "Cancel Bounty"}
+              </button>
+            )}
+
+            {/* Submit work form */}
+            {address && effectiveStatus === 0 && !winnerSlotsFilled && !isBountyExpired(selectedBounty) && address.toLowerCase() !== selectedBounty.poster.toLowerCase() && (
+              <div className="rounded-xl border p-4 mb-4" style={{ borderColor: colors.cardBorder }}>
+                <h3 className="text-sm font-semibold mb-3" style={{ color: colors.pageFg }}>Submit Your Work</h3>
+                <textarea value={subDesc} onChange={e => setSubDesc(e.target.value)} rows={2} placeholder="Describe your submission…"
+                  className="w-full px-3 py-2 rounded-xl border text-sm outline-none resize-none mb-2"
+                  style={{ background: colors.inputBg, borderColor: colors.inputBorder, color: colors.pageFg }} />
+                <Input value={subProof} onChange={e => setSubProof(e.target.value)} placeholder="IPFS proof hash (optional)"
+                  className="mb-2 font-mono" />
+                <IpfsFileUpload
+                  label="Upload Proof File"
+                  compact
+                  existingCid={subProof || undefined}
+                  onUpload={(cid) => setSubProof(cid)}
+                />
+                <button onClick={() => handleSubmitWork(Number(selectedBounty.id))} disabled={busy || !subDesc}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold disabled:opacity-50 btn-hover"
+                  style={{ background: colors.primary, color: colors.primaryText }}>
+                  {busy ? "Submitting…" : "Submit Work"}
+                </button>
+              </div>
+            )}
+
+            {/* Submissions list */}
+            <h3 className="text-sm font-semibold mb-2" style={{ color: colors.pageFg }}>
+              Submissions ({submissions.length})
+            </h3>
+            {submissions.length === 0 ? (
+              <p className="text-sm py-4 text-center" style={{ color: colors.mutedFg }}>No submissions yet</p>
+            ) : (
+              <div className="space-y-2">
+                {submissions.map((s, i) => {
+                  const subStatus = Number(s.status);
+                  const isPoster = address?.toLowerCase() === selectedBounty.poster.toLowerCase();
+                  return (
+                    <div key={i} className="rounded-xl border p-3" style={{ borderColor: colors.cardBorder }}>
+                      <div className="flex items-center justify-between mb-1">
+                        <Link href={`/profile/${s.submitter}`} className="text-xs font-mono underline" style={{ color: colors.primaryFg }}>
+                          {shortenAddress(s.submitter)}
+                        </Link>
+                        <span className="text-xs font-medium px-2 py-0.5 rounded-full"
+                          style={{
+                            background: subStatus === 0 ? colors.warningBg : subStatus === 1 ? colors.successBg : colors.dangerBg,
+                            color: subStatus === 0 ? colors.warningText : subStatus === 1 ? colors.successText : colors.dangerText,
+                          }}>
+                          {SUBMISSION_STATUS[subStatus]}
+                        </span>
+                      </div>
+                      <p className="text-sm mb-1" style={{ color: colors.pageFg }}>{s.description}</p>
+                      {s.ipfsProof && isPoster && (
+                        <a href={resolveIpfsUrl(s.ipfsProof)} target="_blank" rel="noopener noreferrer"
+                          className="text-xs font-mono hover:underline" style={{ color: colors.primaryFg }}>
+                          Proof: {s.ipfsProof.length > 20 ? s.ipfsProof.slice(0, 10) + "…" + s.ipfsProof.slice(-6) : s.ipfsProof} ↗
+                        </a>
+                      )}
+                      {isPoster && subStatus === 0 && !winnerSlotsFilled && (
+                        <div className="flex gap-2 mt-2">
+                          <button onClick={() => handleApprove(Number(s.id), Number(selectedBounty.id))} disabled={busy}
+                            className="text-xs px-3 py-1 rounded-lg font-medium btn-hover"
+                            style={{ background: colors.successBg, color: colors.successText }}>
+                            Approve
+                          </button>
+                          <button onClick={() => handleReject(Number(s.id), Number(selectedBounty.id))} disabled={busy}
+                            className="text-xs px-3 py-1 rounded-lg font-medium btn-hover"
+                            style={{ background: colors.dangerBg, color: colors.dangerText }}>
+                            Reject
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      )}
+    </main>
+  );
+}

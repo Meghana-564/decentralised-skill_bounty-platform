@@ -1,0 +1,322 @@
+"use client";
+import { useState, useEffect, useCallback } from "react";
+import { useWallet } from "@/context/WalletContext";
+import { useTheme } from "@/context/ThemeContext";
+import {
+  getGovernance, getVRTToken, getProvider, formatEth, formatVrt,
+  formatDate, timeRemaining, shortenAddress, CONTRACT_ADDRESSES, NATIVE_SYMBOL,
+} from "@/lib/contracts";
+import { ethers } from "ethers";
+import Link from "next/link";
+import { Input } from "@/components/reactbits/Input";
+import { Label } from "@/components/reactbits/Label";
+import { Landmark, SlidersHorizontal } from "lucide-react";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+const PROPOSAL_STATUS: Record<number, string> = {
+  0: "Active", 1: "Passed", 2: "Rejected", 3: "Executed", 4: "Cancelled",
+};
+
+export default function GovernancePage() {
+  const { address, provider } = useWallet();
+  const { colors } = useTheme();
+  const [proposals, setProposals] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [treasuryBal, setTreasuryBal] = useState<bigint>(0n);
+  const [vrtBalance, setVrtBalance] = useState<bigint>(0n);
+  const [minVrtToPropose, setMinVrtToPropose] = useState("100");
+  const [govVotingDays, setGovVotingDays] = useState(5);
+  const [quorumBps, setQuorumBps] = useState(1000);
+  const [proposalFilter, setProposalFilter] = useState<"all" | "active" | "passed" | "executed">("all");
+  const configured = CONTRACT_ADDRESSES.Governance !== "";
+
+  // Form
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+
+  const load = useCallback(async () => {
+    if (!configured || !provider) return;
+    try {
+      const gov = getGovernance(provider);
+      const count = Number(await gov.proposalCounter());
+      const arr: any[] = [];
+      for (let i = count; i >= 1; i--) {
+        try { arr.push(await gov.getProposal(i)); } catch {}
+      }
+      setProposals(arr);
+      try { setTreasuryBal(await gov.treasuryBalance()); } catch {}
+      try { setMinVrtToPropose(parseFloat(ethers.formatEther(await gov.MIN_VRT_TO_PROPOSE())).toString()); } catch {}
+      try { setGovVotingDays(Number(await gov.VOTING_PERIOD()) / 86400); } catch {}
+      try { setQuorumBps(Number(await gov.MIN_QUORUM_BPS())); } catch {}
+      if (address) {
+        try { setVrtBalance(await getVRTToken(provider).balanceOf(address)); } catch {}
+      }
+    } catch {} finally { setLoading(false); }
+  }, [provider, configured, address]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const signer = await (await getProvider()).getSigner();
+      const gov = getGovernance(signer);
+      const tx = await gov.createProposal(title, description, ethers.ZeroAddress, "0x");
+      await tx.wait();
+      setShowCreate(false); setTitle(""); setDescription("");
+      window.dispatchEvent(new Event("dfm:tx"));
+      load();
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  async function handleVote(pid: number, support: boolean) {
+    setBusy(true);
+    try {
+      const signer = await (await getProvider()).getSigner();
+      const tx = await getGovernance(signer).voteOnProposal(pid, support);
+      await tx.wait();
+      window.dispatchEvent(new Event("dfm:tx"));
+      load();
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  async function handleFinalize(pid: number) {
+    setBusy(true);
+    try {
+      const signer = await (await getProvider()).getSigner();
+      const tx = await getGovernance(signer).finalizeProposal(pid);
+      await tx.wait();
+      window.dispatchEvent(new Event("dfm:tx"));
+      load();
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  async function handleExecute(pid: number) {
+    setBusy(true);
+    try {
+      const signer = await (await getProvider()).getSigner();
+      const tx = await getGovernance(signer).executeProposal(pid);
+      await tx.wait();
+      window.dispatchEvent(new Event("dfm:tx"));
+      load();
+    } catch (err: any) {
+      alert(err?.reason || err?.message || "Transaction failed");
+    } finally { setBusy(false); }
+  }
+
+  if (!configured) {
+    return (
+      <div className="max-w-4xl mx-auto px-4 py-16 text-center" style={{ color: colors.mutedFg }}>
+        <p className="text-lg font-semibold">Governance contract not configured</p>
+        <p className="text-sm mt-2">Deploy contracts and set <code>NEXT_PUBLIC_GOVERNANCE</code> in .env.local</p>
+      </div>
+    );
+  }
+
+  return (
+    <main className="max-w-6xl mx-auto px-4 py-8" style={{ color: colors.pageFg }}>
+      {/* Header */}
+      <div className="mb-8">
+        <h1 className="text-3xl font-extrabold" style={{ color: colors.pageFg }}>Governance</h1>
+        <p className="mt-2 leading-relaxed" style={{ color: colors.mutedFg }}>
+          VRT-weighted proposals — vote on platform decisions and shape the future.
+        </p>
+      </div>
+
+      {/* Stats row */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-8">
+        {[
+          { label: "Treasury", value: `${formatEth(treasuryBal)} ${NATIVE_SYMBOL}`, accent: true },
+          { label: "Your VRT", value: formatVrt(vrtBalance), accent: true },
+          { label: "Total Proposals", value: proposals.length.toString() },
+          { label: "Min VRT to Propose", value: minVrtToPropose },
+          { label: "Voting Period", value: `${Number.isInteger(govVotingDays) ? govVotingDays : govVotingDays.toFixed(1)}d` },
+          { label: "Quorum", value: `${(quorumBps / 100).toFixed(0)}%` },
+        ].map((s, i) => (
+          <div key={i} className="rounded-xl border p-4 stat-hover"
+            style={{ background: s.accent ? colors.primaryLight : colors.cardBg, borderColor: colors.cardBorder }}>
+            <p className="text-xs" style={{ color: colors.mutedFg }}>{s.label}</p>
+            <p className="text-lg font-bold font-mono mt-0.5" style={{ color: s.accent ? colors.primaryFg : colors.pageFg }}>{s.value}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Tabs + Create button */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
+        <div className="flex gap-6" style={{ borderBottom: `2px solid ${colors.cardBorder}` }}>
+          {([
+            { key: "all", label: "All Proposals" },
+            { key: "active", label: "Active" },
+            { key: "passed", label: "Passed" },
+            { key: "executed", label: "Executed" },
+          ] as const).map((t) => (
+            <button key={t.key} onClick={() => setProposalFilter(t.key)}
+              className="relative pb-2.5 text-sm font-medium transition-colors -mb-[2px]"
+              style={proposalFilter === t.key
+                ? { color: colors.primaryFg, borderBottom: `2px solid ${colors.primaryFg}` }
+                : { color: colors.mutedFg, borderBottom: "2px solid transparent" }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+        {address && (
+          <button onClick={() => setShowCreate(true)}
+            className="px-4 py-2 rounded-lg text-sm font-semibold btn-hover"
+            style={{ background: colors.primary, color: colors.primaryText }}>
+            + New Proposal
+          </button>
+        )}
+      </div>
+
+      {/* Proposals list */}
+      {loading ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {[1, 2, 3, 4].map((i) => <div key={i} className="rounded-xl h-40 animate-pulse" style={{ background: colors.inputBg }} />)}
+        </div>
+      ) : proposals.length === 0 ? (
+        <div className="text-center py-20 rounded-2xl border" style={{ background: colors.cardBg, borderColor: colors.cardBorder }}>
+          <Landmark size={40} className="mx-auto mb-3" style={{ color: colors.mutedFg }} />
+          <p className="font-semibold text-lg" style={{ color: colors.pageFg }}>No proposals yet</p>
+          <p className="text-sm mt-1" style={{ color: colors.mutedFg }}>Create the first governance proposal</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {proposals
+            .filter((p) => {
+              const s = Number(p.status);
+              if (proposalFilter === "active") return s === 0;
+              if (proposalFilter === "passed") return s === 1;
+              if (proposalFilter === "executed") return s === 3;
+              return true;
+            })
+            .map((p) => {
+              const status = Number(p.status);
+              const forV = Number(ethers.formatEther(p.forVotes));
+              const againstV = Number(ethers.formatEther(p.againstVotes));
+              const total = forV + againstV;
+              const pct = total > 0 ? Math.round((forV / total) * 100) : 0;
+              const expired = Number(p.deadline) * 1000 < Date.now();
+              return (
+                  <div key={p.id.toString()}
+                  className="rounded-xl border p-5 card-hover"
+                  style={{ background: colors.cardBg, borderColor: colors.cardBorder }}>
+                  <div className="flex items-start justify-between mb-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="text-xs font-semibold px-2 py-0.5 rounded-full"
+                          style={{
+                            background: status === 0 ? colors.infoBg : status === 1 ? colors.successBg : status === 3 ? colors.successBg : colors.dangerBg,
+                            color: status === 0 ? colors.infoText : status === 1 ? colors.successText : status === 3 ? colors.successText : colors.dangerText,
+                          }}>
+                          {PROPOSAL_STATUS[status] || "Unknown"}
+                        </span>
+                        <span className="text-xs" style={{ color: colors.mutedFg }}>#{p.id.toString()}</span>
+                      </div>
+                      <h3 className="font-bold text-base" style={{ color: colors.pageFg }}>{p.title}</h3>
+                      <p className="text-xs mt-1 line-clamp-2" style={{ color: colors.mutedFg }}>{p.description}</p>
+                    </div>
+                    <span className="text-xs shrink-0 ml-4" style={{ color: colors.mutedFg }}>
+                      {expired ? "Ended" : timeRemaining(p.deadline)}
+                    </span>
+                  </div>
+
+                  {/* Vote bar */}
+                  <div className="mt-3">
+                    <div className="flex justify-between text-xs mb-1">
+                      <span style={{ color: colors.successText }}>For: {forV.toFixed(1)} VRT ({pct}%)</span>
+                      <span style={{ color: colors.dangerText }}>Against: {againstV.toFixed(1)} VRT ({100 - pct}%)</span>
+                    </div>
+                    <div className="h-2 rounded-full overflow-hidden" style={{ background: colors.surfaceBg }}>
+                      <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: colors.successText }} />
+                    </div>
+                  </div>
+
+                  {/* Actions */}
+                  {status === 0 && address && !expired && (
+                    <div className="flex gap-2 mt-3">
+                      <button onClick={() => handleVote(Number(p.id), true)} disabled={busy}
+                        className="text-xs px-3 py-1.5 rounded-lg font-medium disabled:opacity-50 btn-hover"
+                        style={{ background: colors.successBg, color: colors.successText }}>
+                        Vote For
+                      </button>
+                      <button onClick={() => handleVote(Number(p.id), false)} disabled={busy}
+                        className="text-xs px-3 py-1.5 rounded-lg font-medium disabled:opacity-50 btn-hover"
+                        style={{ background: colors.dangerBg, color: colors.dangerText }}>
+                        Vote Against
+                      </button>
+                    </div>
+                  )}
+                  {status === 0 && expired && (
+                    <button onClick={() => handleFinalize(Number(p.id))} disabled={busy}
+                      className="text-xs px-3 py-1.5 rounded-lg font-medium mt-3 disabled:opacity-50 btn-hover"
+                      style={{ background: colors.warningBg, color: colors.warningText }}>
+                      Finalize
+                    </button>
+                  )}
+                  {status === 1 && address && (
+                    <button onClick={() => handleExecute(Number(p.id))} disabled={busy}
+                      className="text-xs px-3 py-1.5 rounded-lg font-medium mt-3 disabled:opacity-50 btn-hover"
+                      style={{ background: colors.successBg, color: colors.successText }}>
+                      Execute Proposal
+                    </button>
+                  )}
+                  <p className="text-xs mt-2" style={{ color: colors.mutedFg }}>
+                    Proposed by <Link href={`/profile/${p.proposer}`} className="underline">{shortenAddress(p.proposer)}</Link>
+                    {" · "}{formatDate(p.createdAt)}
+                  </p>
+                </div>
+              );
+            })}
+        </div>
+      )}
+
+      {/* Create Modal */}
+      {showCreate && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setShowCreate(false)}>
+          <div className="w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden" style={{ background: colors.cardBg }} onClick={e => e.stopPropagation()}>
+            {/* Modal header bar */}
+            <div className="flex items-center justify-between px-6 py-4" style={{ background: colors.primary }}>
+              <div className="flex items-center gap-2 text-white">
+                <Landmark size={18} />
+                <span className="font-semibold text-sm">New Proposal</span>
+              </div>
+              <button onClick={() => setShowCreate(false)} className="text-white/70 hover:text-white text-lg">&times;</button>
+            </div>
+            <form onSubmit={handleCreate} className="p-6 space-y-4">
+              <div>
+                <Label className="mb-1 block text-xs font-medium">Title</Label>
+                <Input value={title} onChange={e => setTitle(e.target.value)} required />
+              </div>
+              <div>
+                <Label className="mb-1 block text-xs font-medium">Description</Label>
+                <textarea value={description} onChange={e => setDescription(e.target.value)} required rows={4}
+                  className="w-full px-3 py-2 rounded-xl border text-sm outline-none resize-none"
+                  style={{ background: colors.inputBg, borderColor: colors.inputBorder, color: colors.pageFg }} />
+              </div>
+              <div className="flex gap-3 pt-2">
+                <button type="button" onClick={() => setShowCreate(false)}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-medium border btn-outline-hover"
+                  style={{ borderColor: colors.cardBorder, color: colors.mutedFg }}>Cancel</button>
+                <button type="submit" disabled={busy}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 btn-hover"
+                  style={{ background: colors.primary, color: colors.primaryText }}>
+                  {busy ? "Creating…" : "Create Proposal"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}
