@@ -360,3 +360,10 @@ For Sepolia, you'll need to set `SEPOLIA_RPC_URL` in `contracts/.env` to an Alch
 
 ## License
 MIT
+
+
+## 📁 Project Resources
+
+Access the project presentation, documentation, and video demonstration using the link below:
+
+- **Project Presentation (PPT), Documentation & Video Demo:** [View Project Resources on Google Drive](https://drive.google.com/drive/folders/1G-JTSAmdWtfatpIjNsW_JjIY0jca5_tO?usp=sharing)
